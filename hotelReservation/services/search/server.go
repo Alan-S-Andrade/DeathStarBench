@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"time"
+	"sync/atomic"
 
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
@@ -37,15 +38,35 @@ type Server struct {
 	ConsulAddr string
 	KnativeDns string
 	Registry   *registry.Client
+
+	requestCount int64
+	totalLatency int64
+	totalRequests int64
+	logFile      *os.File
+}
+
+func (s *Server) OpenLogFile() error {
+    var err error
+    s.logFile, err = os.OpenFile("record.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+    if err != nil {
+        return fmt.Errorf("could not open log file: %v", err)
+    }
+    return nil
 }
 
 // Run starts the server
 func (s *Server) Run() error {
+	if err := s.OpenLogFile(); err != nil {
+	        return err
+	}
+	defer s.logFile.Close()
+
 	if s.Port == 0 {
 		return fmt.Errorf("server port must be set")
 	}
 
 	s.uuid = uuid.New().String()
+	s.startRPSTimer()
 
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -127,6 +148,9 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 
 // Nearby returns ids of nearby hotels ordered by ranking algo
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
+	start := time.Now()
+    	atomic.AddInt64(&s.requestCount, 1)
+
 	// find nearby hotels
 	log.Trace().Msg("in Search Nearby")
 
@@ -166,5 +190,40 @@ func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchR
 		log.Trace().Msgf("get RatePlan HotelId = %s, Code = %s", ratePlan.HotelId, ratePlan.Code)
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
+
+	latency := time.Since(start)
+	atomic.AddInt64(&s.totalLatency, int64(latency))	
+	atomic.AddInt64(&s.totalRequests, 1
+
 	return res, nil
+}
+
+func (s *Server) startRPSTimer() {
+    go func() {
+        for {
+            time.Sleep(1 * time.Second)
+
+            requestCount := atomic.LoadInt64(&s.requestCount)
+            totalLatency := atomic.LoadInt64(&s.totalLatency)
+            totalRequests := atomic.LoadInt64(&s.totalRequests)
+
+            rps := requestCount
+            if requestCount > 0 {
+                rps = requestCount // RPS calculation is the total requests for every second
+            }
+
+            averageLatency := time.Duration(0)
+            if totalRequests > 0 {
+                averageLatency = time.Duration(totalLatency) / time.Duration(totalRequests)
+            }
+
+	    // log to server.log output as well
+            log.Info().Msgf("RPS: %d, Average latency: %v\n", rps, averageLatency)
+
+            s.logFile.WriteString(fmt.Sprintf("%v;%d\n", averageLatency.Seconds(), rps))
+
+            // reset request count for the next period
+            atomic.StoreInt64(&s.requestCount, 0)
+        }
+    }()
 }
